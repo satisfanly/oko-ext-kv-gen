@@ -5,11 +5,138 @@ import re
 import os
 from pathlib import Path
 from typing import Optional
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load
+
+
+@dataclass(frozen=True)
+class Qwen35Layout:
+    key_heads: int
+    value_heads: int
+    key_head_dim: int
+    value_head_dim: int
+
+    @classmethod
+    def from_model(cls, model):
+        candidates = [getattr(getattr(model, "model", None), "config", None),
+                      getattr(getattr(model, "config", None), "text_config", None),
+                      getattr(model, "config", None)]
+        for config in candidates:
+            if config is not None and all(hasattr(config, attr) for attr in (
+                "linear_num_key_heads", "linear_num_value_heads",
+                "linear_key_head_dim", "linear_value_head_dim",
+            )):
+                return cls(*(int(getattr(config, attr)) for attr in (
+                    "linear_num_key_heads", "linear_num_value_heads",
+                    "linear_key_head_dim", "linear_value_head_dim",
+                )))
+        raise ValueError("Cannot determine Qwen3.5 linear-attention head layout")
+
+    def __post_init__(self):
+        if (self.key_heads < 1 or self.value_heads < 1 or
+                self.value_heads % self.key_heads or
+                self.key_head_dim < 1 or self.value_head_dim < 1):
+            raise ValueError(f"Invalid Gated DeltaNet head layout: {self}")
+
+    @property
+    def key_width(self):
+        return self.key_heads * self.key_head_dim
+
+    @property
+    def value_width(self):
+        return self.value_heads * self.value_head_dim
+
+    @property
+    def conv_width(self):
+        return 2 * self.key_width + self.value_width
+
+    def gguf_to_hf_index(self, head_dim: int) -> torch.Tensor:
+        """For GGUF (tiled) index j, return its HF (grouped) source index."""
+        ratio = self.value_heads // self.key_heads
+        return (torch.arange(self.value_heads * head_dim, dtype=torch.long)
+                .reshape(self.key_heads, ratio, head_dim)
+                .permute(1, 0, 2).reshape(-1))
+
+    def hf_to_gguf_index(self, head_dim: int) -> torch.Tensor:
+        """For HF index i, return its GGUF (tiled) source index."""
+        return torch.argsort(self.gguf_to_hf_index(head_dim))
+
+
+def _is_delta(name: str) -> bool:
+    return ".linear_attn." in name
+
+
+def _is_plain_norm(name: str) -> bool:
+    # Qwen3.5 ordinary RMSNorm expects (1 + parameter). The gated DeltaNet
+    # output normalization expects *parameter*, without a +1. The GGUF
+    # converter adds one to all the former and deliberately excludes the latter.
+    return name.endswith("norm.weight") and not name.endswith(".linear_attn.norm.weight")
+
+
+def _row_index(name: str, layout: Qwen35Layout) -> torch.Tensor | None:
+    if not _is_delta(name):
+        return None
+    if name.endswith(".in_proj_qkv.weight"):
+        qk = 2 * layout.key_width
+        return torch.cat((torch.arange(qk, dtype=torch.long),
+                          qk + layout.hf_to_gguf_index(layout.value_head_dim)))
+    if name.endswith((".in_proj_z.weight", ".conv1d.weight")):
+        idx = layout.hf_to_gguf_index(layout.value_head_dim)
+        if name.endswith(".conv1d.weight"):
+            qk = 2 * layout.key_width
+            return torch.cat((torch.arange(qk, dtype=torch.long), qk + idx))
+        return idx
+    if name.endswith((".in_proj_b.weight", ".in_proj_a.weight",
+                      ".A_log", ".dt_bias")):
+        return layout.hf_to_gguf_index(1)
+    return None
+
+
+def q8_runtime_permutations(name: str, layout: Qwen35Layout) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """(input_index, output_index) applied around GGML's unchanged packed Q8 op.
+
+    For out_proj: GGUF weights take tiled input; pass x_hf[GGUF->HF idx].
+    For V-producing projections: GGUF outputs tiled; return y_gguf[HF->GGUF idx].
+    This avoids dequantizing/repacking GGML Q8_0 blocks.
+    """
+    input_idx = None
+    output_idx = _row_index(name, layout)
+    if name.endswith(".linear_attn.out_proj.weight"):
+        input_idx = layout.gguf_to_hf_index(layout.value_head_dim)
+    return input_idx, output_idx
+
+
+def restore_hf_non_q8(weights: torch.Tensor, gguf_name: str, hf_name: str, layout: Qwen35Layout) -> torch.Tensor:
+    """Inverse GGUF conversion, operating on CPU PyTorch tensors.
+
+    Should be applied exactly ONCE before materializing a HF parameter.
+    """
+    # llama.cpp converted A_log using -exp(A_log), the original parameter
+    # needs log(-GGUF_A). Use F32 to avoid FP16 underflow/precision loss.
+    if hf_name.endswith(".linear_attn.A_log"):
+        a = weights.float()
+        if not bool(torch.isfinite(a).all()) or not bool((a < 0).all()):
+            raise ValueError(f"Invalid GGUF SSM A (must be finite negative): {gguf_name}")
+        weights = (-a).log()
+    if _is_plain_norm(hf_name):
+        weights = weights.float() - 1.0
+    row_index = _row_index(hf_name, layout)
+    if row_index is not None:
+        if weights.shape[0] != row_index.numel():
+            raise ValueError(f"{gguf_name} -> {hf_name}: head reorder requires dimension 0 "
+                             f"of {row_index.numel()}, got {tuple(weights.shape)}")
+        weights = weights.index_select(0, row_index)
+    if hf_name.endswith(".linear_attn.out_proj.weight"):
+        idx = layout.hf_to_gguf_index(layout.value_head_dim)
+        if weights.shape[1] != idx.numel():
+            raise ValueError(f"{gguf_name} -> {hf_name}: expected input width {idx.numel()}")
+        weights = weights.index_select(1, idx)
+    return weights
+
 
 _EXT = None
 _BACKEND_READY = False
@@ -105,11 +232,14 @@ class GGMLQ8Linear(nn.Module):
     This is intentionally slow. It is for numerical-parity bring-up.
     """
 
-    def __init__(self, packed: torch.Tensor, in_features: int, out_features: int, bias=None):
+    def __init__(self, packed: torch.Tensor, in_features: int, out_features: int, bias=None,
+                 input_permutation=None, output_permutation=None):
         super().__init__()
         self._packed_q8 = packed
         self.in_features = int(in_features)
         self.out_features = int(out_features)
+        self.input_permutation = input_permutation
+        self.output_permutation = output_permutation
         if bias is not None:
             self.register_buffer("bias", bias.detach().cpu(), persistent=False)
         else:
@@ -134,6 +264,9 @@ class GGMLQ8Linear(nn.Module):
             device="cpu", dtype=torch.float32
         ).contiguous()
 
+        if self.input_permutation is not None:
+            x2 = x2.index_select(-1, self.input_permutation)
+
         y = ext.q8_mul_mat(
             self._packed_q8,
             self.in_features,
@@ -141,6 +274,8 @@ class GGMLQ8Linear(nn.Module):
             x2,
         )
         y = y.reshape(*shape[:-1], self.out_features)
+        if self.output_permutation is not None:
+            y = y.index_select(-1, self.output_permutation)
         y = y.to(device=x.device, dtype=x.dtype)
 
         if self.bias is not None:
@@ -151,15 +286,18 @@ class GGMLQ8Linear(nn.Module):
 class GGMLQ8Embedding(nn.Module):
     """nn.Embedding-compatible Q8_0 get_rows using GGML CUDA."""
 
-    def __init__(self, packed: torch.Tensor, num_embeddings: int, embedding_dim: int):
+    def __init__(self, packed: torch.Tensor, num_embeddings: int, embedding_dim: int,
+                 output_dtype: torch.dtype = torch.bfloat16):
         super().__init__()
         self._packed_q8 = packed
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
+        self.output_dtype = output_dtype
 
     @classmethod
     def from_embedding(cls, module: nn.Embedding, packed: torch.Tensor):
-        return cls(packed, module.num_embeddings, module.embedding_dim)
+        return cls(packed, module.num_embeddings, module.embedding_dim,
+                   output_dtype=module.weight.dtype)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         ext = load_extension()
@@ -172,9 +310,9 @@ class GGMLQ8Embedding(nn.Module):
         )
         y = y.reshape(*input_ids.shape, self.embedding_dim)
 
-        # The original runner keeps embeddings in BF16 on CUDA.
+        # Keep embeddings consistent with the configured HF compute dtype.
         target_device = input_ids.device
-        target_dtype = torch.bfloat16
+        target_dtype = self.output_dtype
         return y.to(device=target_device, dtype=target_dtype)
 
 
@@ -279,6 +417,7 @@ def patch_model_q8_0_from_gguf(
     processor = TensorProcessor(config=model.config.to_dict())
     gguf_to_hf = get_gguf_hf_weights_map(model, processor, model_type="qwen35")
     _augment_qwen35_gguf_mapping(model, gguf_to_hf)
+    layout = Qwen35Layout.from_model(model)
 
     replaced = []
     unsupported = []
@@ -311,7 +450,11 @@ def patch_model_q8_0_from_gguf(
         packed = _raw_u8_view(t.data)
 
         if isinstance(module, nn.Linear):
-            replacement = GGMLQ8Linear.from_linear(module, packed)
+            inp_perm, out_perm = q8_runtime_permutations(hf_name, layout)
+            replacement = GGMLQ8Linear(
+                packed, module.in_features, module.out_features, module.bias,
+                input_permutation=inp_perm, output_permutation=out_perm,
+            )
         elif isinstance(module, nn.Embedding):
             replacement = GGMLQ8Embedding.from_embedding(module, packed)
         else:
@@ -414,6 +557,7 @@ def load_model_from_gguf_without_q8_dequant(
     processor = TensorProcessor(config=model.config.to_dict())
     gguf_to_hf = get_gguf_hf_weights_map(model, processor, model_type="qwen35")
     _augment_qwen35_gguf_mapping(model, gguf_to_hf)
+    layout = Qwen35Layout.from_model(model)
 
     non_q8_state = {}
     replacements = []
@@ -447,18 +591,18 @@ def load_model_from_gguf_without_q8_dequant(
 
         packed = _raw_u8_view(t.data)
         if isinstance(module, nn.Linear):
-            # Bias is a separate non-Q8 tensor and will be loaded below if present.
+            # Keep the GGUF Q8_0 bytes intact; adapt V-head ordering at runtime.
+            inp_perm, out_perm = q8_runtime_permutations(hf_name, layout)
             replacement = GGMLQ8Linear(
-                packed,
-                module.in_features,
-                module.out_features,
-                bias=None,
+                packed, module.in_features, module.out_features, bias=None,
+                input_permutation=inp_perm, output_permutation=out_perm,
             )
         elif isinstance(module, nn.Embedding):
             replacement = GGMLQ8Embedding(
                 packed,
                 module.num_embeddings,
                 module.embedding_dim,
+                output_dtype=dtype,
             )
         else:
             unsupported_q8.append((t.name, hf_name, type(module).__name__))
@@ -512,6 +656,7 @@ def load_model_from_gguf_without_q8_dequant(
             continue
 
         tensor = torch.from_numpy(np.copy(result.weights))
+        tensor = restore_hf_non_q8(tensor, t.name, target_name, layout)
 
         # Qwen3.5/Qwen3.8 DeltaNet depthwise Conv1d is stored in GGUF as
         # [channels, kernel_size], while Hugging Face nn.Conv1d expects

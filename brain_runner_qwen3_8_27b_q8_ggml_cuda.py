@@ -144,7 +144,7 @@ class brain_runner:
         # Their forward ops are executed by GGML's CUDA backend.
         model = load_model_from_gguf_without_q8_dequant(
             model_dir,
-            dtype=torch.bfloat16,
+            dtype=GPU_COMPUTE_DTYPE,
             strict_q8=True,
             verbose=True,
         )
@@ -181,7 +181,7 @@ class brain_runner:
         print(
             "[attention] transformers implementation=sdpa; "
             "full-attention CUDA kernel=EFFICIENT_ATTENTION "
-            "(forced, persistent FP16 K/V workspace, BF16 cache in CPU RAM)"
+            f"(forced, persistent FP16 K/V workspace, {GPU_COMPUTE_DTYPE} cache in CPU RAM)"
         )
 
         model.eval()
@@ -221,10 +221,10 @@ class brain_runner:
         Persistent for the duration of this full-attention layer:
           * key_workspace_fp16/value_workspace_fp16 on CUDA, preallocated for
             the complete sequence exactly once
-          * key_cache_cpu/value_cache_cpu in BF16 RAM, also preallocated once
+          * key_cache_cpu/value_cache_cpu in the configured dtype in RAM
 
         Per chunk:
-          1. project Q/K/V in the native model dtype (BF16)
+          1. project Q/K/V in the native model dtype (FP16 or BF16)
           2. apply absolute RoPE for this chunk
           3. copy ONLY the new K/V chunk into:
                a) the final BF16 CPU HF-cache backing tensors
@@ -602,7 +602,7 @@ class brain_runner:
         DeltaNet prefill is evaluated sequentially in `linear_attn_chunk_tokens`
         chunks. Full attention is also evaluated sequentially in
         `full_attn_chunk_tokens` query chunks using one fixed FP16 K/V CUDA
-        workspace while the final BF16 cache is filled directly in CPU RAM.
+        workspace while the final configured-dtype cache is filled directly in CPU RAM.
         The cache slot is evacuated immediately after
         the attention phase. The attention output returns to CPU before the MLP
         starts. The MLP is evaluated in `mlp_chunk_tokens` sequence chunks.
@@ -907,7 +907,7 @@ class brain_runner:
                         head_dim,
                     )
 
-                    # Final HF cache backing tensors: native BF16 in RAM.
+                    # Final HF cache backing tensors: model dtype in RAM.
                     key_cache_cpu = torch.empty(
                         workspace_shape,
                         dtype=hidden_states_cpu.dtype,

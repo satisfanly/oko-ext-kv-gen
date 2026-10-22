@@ -10,6 +10,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import torch
 
+
 # llama.cpp GGSQ sequence-state file format v3 (e.g. commit 19e28a2 / b11277).
 # This project intentionally targets v3, not current v4.
 LLAMA_STATE_SEQ_MAGIC = 0x67677371  # 'ggsq'
@@ -87,6 +88,18 @@ class Qwen38Spec:
 QWEN38_27B = Qwen38Spec()
 
 
+def _gguf_to_hf_value_index(spec: Qwen38Spec, head_dim: int) -> torch.Tensor:
+    """GGUF tiled V-head order -> HF grouped heads, for cache export.
+    """
+    key_heads = spec.linear_num_key_heads
+    value_heads = spec.linear_num_value_heads
+    if key_heads < 1 or value_heads < 1 or value_heads % key_heads or head_dim < 1:
+        raise ValueError("Invalid Qwen3.5 value/key head layout")
+    return (torch.arange(value_heads * head_dim, dtype=torch.long)
+            .reshape(key_heads, value_heads // key_heads, head_dim)
+            .permute(1, 0, 2).reshape(-1))
+
+
 def _u32(x: int) -> bytes:
     return struct.pack("<I", int(x))
 
@@ -124,7 +137,8 @@ def recurrent_r_row(conv_state: torch.Tensor, *, spec: Qwen38Spec = QWEN38_27B) 
 
     HF stores [B, conv_channels, kernel_size]. llama.cpp R is a GGML tensor whose
     logical shape is [kernel_size-1, conv_channels, cell], with dim0 fastest.
-    Therefore one serialized cell row is HF[:, :, -history:].flatten(C).
+    Therefore one serialized cell row is GGUF[:, :, -history:].flatten(C).
+    GGUF has tiled V-head order, while HF keeps grouped V-head order.
     """
     if conv_state.ndim != 3 or conv_state.shape[0] != 1:
         raise ValueError(f"expected conv state [1,C,K], got {tuple(conv_state.shape)}")
@@ -140,7 +154,13 @@ def recurrent_r_row(conv_state: torch.Tensor, *, spec: Qwen38Spec = QWEN38_27B) 
 
     history = spec.linear_conv_kernel_dim - 1
     # [C,history] in C order => history (GGML dim0) is fastest.
-    row = conv_state.detach()[0, :, -history:].to(device="cpu", dtype=torch.float32).contiguous()
+    # Reorder the V channels (leave Q/K channels intact) from HF grouped to
+    # GGUF tiled order, matching llama.cpp's _LinearAttentionVReorderBase.
+    qk_width = 2 * spec.linear_num_key_heads * spec.linear_key_head_dim
+    v_idx = _gguf_to_hf_value_index(spec, spec.linear_value_head_dim)
+    idx = torch.cat((torch.arange(qk_width, dtype=torch.long), qk_width + v_idx))
+    row = conv_state.detach()[0, :, -history:].to(device="cpu", dtype=torch.float32)
+    row = row.index_select(0, idx).contiguous()
     a = np.asarray(row.numpy().reshape(-1), dtype=np.dtype("<f4"), order="C")
     if a.size != spec.recurrent_r_width:
         raise AssertionError(f"internal R width mismatch: {a.size} != {spec.recurrent_r_width}")
@@ -154,8 +174,8 @@ def recurrent_s_row(recurrent_state: torch.Tensor, *, spec: Qwen38Spec = QWEN38_
     llama.cpp views S as GGML [key_dim, value_dim, value_heads, cell].
 
     GGML dim0 is fastest, so serialized order must be:
-        head -> value_dim -> key_dim
-    which is HF[0].permute(0, 2, 1) before a C-order flatten.
+        GGUF_tiled_head -> value_dim -> key_dim
+    which is HF[0][GGUF_to_HF_heads].permute(0, 2, 1) before flattening.
     """
     expected = (
         1,
@@ -166,9 +186,11 @@ def recurrent_s_row(recurrent_state: torch.Tensor, *, spec: Qwen38Spec = QWEN38_
     if tuple(recurrent_state.shape) != expected:
         raise ValueError(f"unexpected recurrent state {tuple(recurrent_state.shape)}; expected {expected}")
 
+    head_idx = _gguf_to_hf_value_index(spec, 1)
     row = (
         recurrent_state.detach()[0]
         .to(device="cpu", dtype=torch.float32)
+        .index_select(0, head_idx)
         .permute(0, 2, 1)  # [H,V,K], K becomes fastest after C flatten
         .contiguous()
     )
