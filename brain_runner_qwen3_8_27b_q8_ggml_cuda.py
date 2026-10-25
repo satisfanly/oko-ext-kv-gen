@@ -33,8 +33,8 @@ tf_utils.auto_docstring = _noop_auto_docstring
 from trainer_utils import modules as mu
 
 SEED = 42
-MLP_CHUNK_TOKENS = 4096
-LINEAR_ATTN_CHUNK_TOKENS = 8192
+MLP_CHUNK_TOKENS = 1024
+LINEAR_ATTN_CHUNK_TOKENS = 1024
 FULL_ATTN_CHUNK_TOKENS = 512
 GPU_COMPUTE_DTYPE = torch.float16
 

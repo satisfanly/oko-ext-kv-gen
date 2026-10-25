@@ -189,12 +189,36 @@ def load_extension(
             libggml = hits[0]
             build_bin = libggml.parent
 
+        # The host-side PyTorch CUDA-stream header includes CUDA runtime
+        # headers even though this extension does not compile CUDA kernels.
+        # With `with_cuda=False`, cpp_extension does not automatically add the
+        # CUDA toolkit include directory, so resolve it explicitly.
+        cuda_include_dirs = []
+        cuda_candidates = [
+            os.environ.get("CUDA_HOME"),
+            os.environ.get("CUDA12_ROOT"),
+            os.environ.get("CUDA_PATH"),
+            "/opt/cuda-12.8", "/opt/cuda", "/usr/local/cuda",
+        ]
+        for candidate in cuda_candidates:
+            if candidate and (Path(candidate) / "include" / "cuda_runtime_api.h").exists():
+                cuda_include_dirs.append(str(Path(candidate) / "include"))
+                break
+        if not cuda_include_dirs:
+            raise RuntimeError(
+                "CUDA headers required by c10/cuda/CUDAStream.h were not found. "
+                "Set CUDA_HOME or CUDA12_ROOT to your CUDA toolkit directory."
+            )
+
         _EXT = load(
             name="ggml_q8_cuda_ext",
             sources=[str(src)],
-            extra_include_paths=[str(include_dir)],
+            extra_include_paths=[str(include_dir), *cuda_include_dirs],
             extra_cflags=["-O3"],  # PyTorch already supplies the required -std=c++20
             extra_ldflags=[
+                # The CUDA input path uses c10's current-stream API but does
+                # not compile any custom CUDA kernels (with_cuda=False).
+                "-lc10_cuda", "-ltorch_cuda",
                 str(libggml),
                 f"-Wl,-rpath,{build_bin}",
             ],
@@ -224,12 +248,16 @@ class GGMLQ8Linear(nn.Module):
     """
     nn.Linear-compatible inference module using original GGUF Q8_0 blocks.
 
-    Correctness-first implementation: activations are copied to CPU F32, GGML
-    uploads both activation and packed weight to its CUDA backend, computes the
-    actual GGML Q8_0 mul_mat, returns CPU F32, then we copy/cast back to the
-    original PyTorch device/dtype.
+    Q8_0 GGML CUDA projection without any additional CUDA-resident weights.
 
-    This is intentionally slow. It is for numerical-parity bring-up.
+    Activations are copied/cast DIRECTLY into GGML's existing CUDA input
+    buffer for the common (non-permuted) case. No CPU activation round-trip,
+    additional GPU allocations, or altered matmul dtype are required.
+    Permuted inputs retain the original CPU staging path to avoid an extra
+    CUDA index_select allocation. Output handling retains the original CPU
+    staging to avoid overlapping a second CUDA output with GGML buffers.
+
+    GGML_Q8_DIRECT_INPUT=0 restores the original input path for A/B tests.
     """
 
     def __init__(self, packed: torch.Tensor, in_features: int, out_features: int, bias=None,
@@ -260,12 +288,21 @@ class GGMLQ8Linear(nn.Module):
         if shape[-1] != self.in_features:
             raise RuntimeError(f"Q8 linear expected last dim {self.in_features}, got {shape[-1]}")
 
-        x2 = x.detach().reshape(-1, self.in_features).to(
-            device="cpu", dtype=torch.float32
-        ).contiguous()
-
-        if self.input_permutation is not None:
-            x2 = x2.index_select(-1, self.input_permutation)
+        x2 = x.detach().reshape(-1, self.in_features)
+        direct_input = (
+            x2.is_cuda
+            and self.input_permutation is None
+            and os.environ.get("GGML_Q8_DIRECT_INPUT", "1").lower()
+            not in ("0", "false")
+        )
+        if direct_input:
+            # The extension casts into its *already allocated* F32 input
+            # buffer. Do not make a separate GPU F32 activation here.
+            x2 = x2.contiguous()
+        else:
+            x2 = x2.to(device="cpu", dtype=torch.float32).contiguous()
+            if self.input_permutation is not None:
+                x2 = x2.index_select(-1, self.input_permutation)
 
         y = ext.q8_mul_mat(
             self._packed_q8,
