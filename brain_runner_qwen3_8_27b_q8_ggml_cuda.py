@@ -129,6 +129,50 @@ def _module_cuda_tensors(module, prefix="module"):
     return out
 
 
+def require_fast_kernels():
+    import importlib
+    import sys
+
+    required = {
+        "causal-conv1d": (
+            "causal_conv1d",
+            ["causal_conv1d_fn", "causal_conv1d_update"],
+        ),
+        "flash-linear-attention": (
+            "fla.ops.gated_delta_rule",
+            ["chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule"],
+        ),
+    }
+
+    errors = []
+
+    for package, (module_name, functions) in required.items():
+        try:
+            module = importlib.import_module(module_name)
+
+            for name in functions:
+                if not callable(getattr(module, name, None)):
+                    raise ImportError(f"{name} is unavailable")
+
+            print(f"[kernels] {package}: OK")
+
+        except Exception as exc:
+            errors.append(f"{package}: {exc}")
+            print(f"[kernels] {package}: FAILED")
+
+    if errors:
+        raise RuntimeError(
+            "Required optimized kernels are unavailable:\n"
+            + "\n".join(errors)
+            + "\n\nInstall using:\n"
+            + f"{sys.executable} -m pip install "
+              "causal-conv1d flash-linear-attention"
+        )
+
+    print("[kernels] All optimized kernels available")
+    return True
+
+
 class brain_runner:
     def __prep_model(self, model_dir):
         if not model_dir.endswith(".gguf"):
@@ -1343,6 +1387,8 @@ class brain_runner:
         linear_attn_chunk_tokens=LINEAR_ATTN_CHUNK_TOKENS,
         full_attn_chunk_tokens=FULL_ATTN_CHUNK_TOKENS,
     ):
+        require_fast_kernels()
+
         self.model = self.__prep_model(model_dir)
 
         self.mlp_chunk_tokens = int(mlp_chunk_tokens)
